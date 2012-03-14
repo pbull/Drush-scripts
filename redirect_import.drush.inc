@@ -73,6 +73,9 @@ function drush_redirect_import_import_redirects($file = NULL) {
   
 }
 
+/**
+ * Parse CSV file and import redirects.
+ */
 function drush_redirect_import_csv($filepath) {
   $count_add = 0;
   $count_skip = 0;
@@ -81,21 +84,21 @@ function drush_redirect_import_csv($filepath) {
   if (($handle = fopen($filepath, "r")) !== FALSE) {
     
     // Delete existing redirects
-    drush_redirect_delete_all_redirects();
+    drush_redirect_import_delete_all_redirects();
     
     $status_code_options = redirect_status_code_options();
     while (($data = fgetcsv($handle, 1000, ",")) !== FALSE) {     //1000????
       
-      // status code validation
+      // Status code validation
       $status_code = (count($data) > 2) ? trim($data[2]) : NULL;
       if (is_null($status_code) || !array_key_exists($status_code, $status_code_options)) {
         $status_code = variable_get('redirect_default_status_code', 301);
       }
       
-      // clean up source
+      // Clean up source
       $source = str_replace(url('', array('absolute' => TRUE)), '', trim($data[0]));
       
-      // clean up target if it's not a full url
+      // Clean up target if it's not a full url
       $target = trim($data[1]);
       if (!preg_match("/^https?:\/\//", $target)) {
         $arr_t = explode("/", $target);
@@ -107,40 +110,7 @@ function drush_redirect_import_csv($filepath) {
         $target = implode("/", $arr_t);
       }
       
-      // add redirect
-      if ($source && $target && ($source != $target)) {
-        $redirect = new stdClass();
-        redirect_object_prepare($redirect);
-        $redirect->source = $source;
-        $redirect->redirect = $target;
-        $redirect->status_code = $status_code;
-        
-        // Check whether source path already exists
-        redirect_hash($redirect);
-        if ($existing = redirect_load_by_hash($redirect->hash)) {
-          
-          // TODO: we could update existing redirects if we add a cli option
-          
-          $count_skip++;
-          drush_print(t('Redirect from @source already exists. Skipping this entry.', array('@source' => $source)));
-        }
-        else {
-          redirect_save($redirect);
-          $count_add++;
-          
-          if (drush_get_context('DRUSH_VERBOSE')) {
-            drush_print(t('Redirecting @source to @target (with status code @status_code)',
-              array('@source' => $source, '@target' => $target, '@status_code' => $status_code)));
-          }
-          
-        }
-        
-        // Dump redirect object
-        if (drush_get_context('DRUSH_DEBUG')) {
-          drush_print_r($redirect);
-        }
-        
-      }
+      drush_redirect_import_save_redirect($source, $target, $status_code, $count_add, $count_skip);
       
     }
     fclose($handle);
@@ -149,23 +119,107 @@ function drush_redirect_import_csv($filepath) {
     return;
   }
   else {
-    drush_set_error('IMPORT_REDIRECTS', dt('Unable to open filefor reading.'));
+    drush_set_error('IMPORT_REDIRECTS', dt('Unable to open file for reading.'));
     return;
   }
 }
 
+/**
+ * Parse Redirect entries in .htaccess file and import redirects.
+ */
 function drush_redirect_import_htaccess($filepath) {
+  $count_add = 0;
+  $count_skip = 0;
   
+  // Loop through csv file
+  if (($handle = fopen($filepath, "r")) !== FALSE) {
+    $status_code_options = redirect_status_code_options();
+    $data = fread($handle, filesize($filepath));
+    
+    // Delete existing redirects
+    drush_redirect_import_delete_all_redirects();
+    
+    // Match Redirect directives
+    preg_match_all('/redirect\s+(\d+)\s+(.*?)\s+(.*?)\s/i', $data, $matches, PREG_SET_ORDER);
+    foreach ($matches as $match) {
+      
+      // Status code validation
+      $status_code = trim($match[1]);
+      if (!array_key_exists($status_code, $status_code_options)) {
+        $status_code = variable_get('redirect_default_status_code', 301);
+      }
+      
+      // Clean up source
+      $source = str_replace(url('', array('absolute' => TRUE)), '', $match[2]);
+      $source = preg_replace('/^\//', '', $source);
+      
+      // Clean up target
+      $target = str_replace(url('', array('absolute' => TRUE)), '', $match[3]);
+      if (!preg_match("/^https?:\/\//", $target)) {
+        $target = preg_replace('/^\//', '', $target);
+      }
+      
+      drush_redirect_import_save_redirect($source, $target, $status_code, $count_add, $count_skip);
+      
+    }
+    fclose($handle);
+    drush_print(t('Imported @count redirects.', array('@count' => $count_add)));
+    drush_print(t('Skipped @count duplicate or previously existing redirects.', array('@count' => $count_skip)));
+    return;
+  }
+  else {
+    drush_set_error('IMPORT_REDIRECTS', dt('Unable to open file for reading.'));
+    return;
+  }
 }
 
 /**
  * Delete all existing redirects from the database.
  */
-function drush_redirect_delete_all_redirects() {
+function drush_redirect_import_delete_all_redirects() {
   $delete = drush_get_option('delete');
   if ($delete) {
     $rids = db_query('SELECT rid FROM {redirect}', array())->fetchCol();
     redirect_delete_multiple($rids);
     drush_print(t('Deleted @count existing redirects.', array('@count' => count($rids))));
+  }
+}
+
+/**
+ * Add new redirect.
+ */
+function drush_redirect_import_save_redirect($source, $target, $status_code, &$count_add, &$count_skip) {
+  if ($source && $target && ($source != $target)) {
+    $redirect = new stdClass();
+    redirect_object_prepare($redirect);
+    $redirect->source = $source;
+    $redirect->redirect = $target;
+    $redirect->status_code = $status_code;
+    
+    // Check whether source path already exists
+    redirect_hash($redirect);
+    if ($existing = redirect_load_by_hash($redirect->hash)) {
+      
+      // TODO: we could update existing redirects if we add a cli option
+      
+      $count_skip++;
+      drush_print(t('Redirect from @source already exists. Skipping this entry.', array('@source' => $source)));
+    }
+    else {
+      redirect_save($redirect);
+      $count_add++;
+      
+      if (drush_get_context('DRUSH_VERBOSE')) {
+        drush_print(t('Redirecting @source to @target (with status code @status_code)',
+          array('@source' => $source, '@target' => $target, '@status_code' => $status_code)));
+      }
+      
+    }
+    
+    // Dump redirect object
+    if (drush_get_context('DRUSH_DEBUG')) {
+      drush_print_r($redirect);
+    }
+    
   }
 }
